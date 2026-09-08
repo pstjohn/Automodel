@@ -69,7 +69,7 @@ def _get_forward_signature(model: nn.Module) -> inspect.Signature | None:
 
 def _supports_logits_to_keep(model: nn.Module) -> bool:
     """
-    Check if the model supports logits_to_keep.
+    Check if the model can accept ``logits_to_keep`` as a keyword argument.
 
     Args:
         model (nn.Module): The model to check.
@@ -78,7 +78,11 @@ def _supports_logits_to_keep(model: nn.Module) -> bool:
         bool: True if the model supports logits_to_keep, False otherwise.
     """
     sig = _get_forward_signature(model)
-    return sig is not None and "logits_to_keep" in sig.parameters
+    if sig is None:
+        return False
+    return "logits_to_keep" in sig.parameters or any(
+        param.kind == inspect.Parameter.VAR_KEYWORD for param in sig.parameters.values()
+    )
 
 
 def _supports_seq_lens(model: nn.Module) -> bool:

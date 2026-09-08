@@ -1242,8 +1242,13 @@ class _StageWithLogitsToKeep(nn.Module):
 
 
 class _StageNoLogitsToKeep(nn.Module):
-    def forward(self, input_ids=None, **kwargs):
+    def forward(self, input_ids=None):
         return None
+
+
+class _StageWithForwardedKwargs(_StageWithLogitsToKeep):
+    def forward(self, input_ids=None, **kwargs):
+        return super().forward(input_ids=input_ids, **kwargs)
 
 
 @pytest.mark.parametrize(
@@ -1272,6 +1277,18 @@ def test_maybe_downgrade_loss_fn(has_logits_to_keep, has_marker, pp_enabled, exp
     assert isinstance(result, FusedLinearCrossEntropy) is expect_fused
     if not expect_fused:
         assert isinstance(result, MaskedCrossEntropy)
+
+
+def test_maybe_downgrade_loss_fn_keeps_fused_loss_for_forwarded_kwargs():
+    """A forwarding decorator's ``**kwargs`` preserves the configured fused loss."""
+    from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+    from nemo_automodel.recipes.llm.train_ft import _maybe_downgrade_loss_fn
+
+    loss_fn = FusedLinearCrossEntropy()
+
+    result = _maybe_downgrade_loss_fn(loss_fn, _StageWithForwardedKwargs(), pp_enabled=False)
+
+    assert result is loss_fn
 
 
 def test_run_train_validation_loop_calls_gc_hook_once_per_step():
