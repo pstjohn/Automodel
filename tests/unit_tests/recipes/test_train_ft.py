@@ -36,6 +36,7 @@ from nemo_automodel.components.datasets.loader import (
 )
 from nemo_automodel.components.distributed.utils import dp_eval_sample_shard
 from nemo_automodel.components.eval.tool_call_evaluator import ToolCallAccuracyEvaluator
+from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.loss.mtp import PipelineCausalLMLoss
 from nemo_automodel.components.models.deepseek_v4.cp import dsv4_cp_local_seq_multiple
 from nemo_automodel.components.optim.optimizer import build_optimizer_config
@@ -1486,6 +1487,7 @@ def test_run_validation_epoch_pp_sends_loss_from_last_stage_to_main(monkeypatch)
 
     pp_info = MockPPInfo(has_first_stage=True, has_last_stage=True)
     recipe = _create_minimal_recipe_for_pp_test(monkeypatch, pp_info)
+    object.__setattr__(recipe, "loss_fn", MaskedCrossEntropy(reduction="sum"))
 
     # Set up recipe attributes for validation - use object.__setattr__ to bypass state tracking
     object.__setattr__(recipe, "model_parts", [DummyModel()])
@@ -1542,6 +1544,7 @@ def test_run_validation_epoch_pp_main_rank_receives_from_last_stage(monkeypatch)
 
     pp_info = MockPPInfo(has_first_stage=True, has_last_stage=False)
     recipe = _create_minimal_recipe_for_pp_test(monkeypatch, pp_info)
+    object.__setattr__(recipe, "loss_fn", MaskedCrossEntropy(reduction="sum"))
 
     # Set up recipe attributes - use object.__setattr__ to bypass state tracking
     object.__setattr__(recipe, "model_parts", [DummyModel()])
@@ -2377,6 +2380,7 @@ def _make_eval_recipe(distributed_config, evaluator):
     """
     recipe = TrainFinetuneRecipeForNextTokenPrediction.__new__(TrainFinetuneRecipeForNextTokenPrediction)
     recipe.model_parts = [SimpleNamespace(eval=lambda: None)]
+    recipe.loss_fn = MaskedCrossEntropy(reduction="sum")
     recipe.dist_env = SimpleNamespace(device=torch.device("cpu"), is_main=True)
     recipe.optimizer = [SimpleNamespace(param_groups=[{"lr": 0.01}])]
     recipe.pp_enabled = False

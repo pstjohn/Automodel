@@ -256,10 +256,12 @@ class FusedLinearCrossEntropy(nn.Module):
             targets=labels,
             ignore_index=self.ignore_index,
             softcap=self.logit_softcapping,
-            reduction=self.reduction,  # Use sum reduction to handle normalization ourselves
+            reduction="sum" if self.reduction == "mean" else self.reduction,
             shift=False,  # Match PyTorch behavior
             filter_eps=None,  # No token filtering
         )
+        if self.reduction == "mean":
+            loss = loss / (labels != self.ignore_index).sum().clamp_min(1)
         if num_label_tokens is not None:
             assert self.reduction == "sum", "num_label_tokens is only supported when reduction is 'sum'"
             loss = loss / num_label_tokens

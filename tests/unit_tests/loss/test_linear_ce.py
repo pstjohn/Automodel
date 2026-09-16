@@ -250,3 +250,34 @@ def test_fused_cross_entropy_normalizes_by_num_tokens(monkeypatch):
     # The stub returns 20, so after division by 10 we expect 2.0
     assert torch.is_tensor(out)
     assert out.item() == pytest.approx(2.0)
+
+
+@pytest.mark.skipif(not HAVE_CUT_CROSS_ENTROPY or not torch.cuda.is_available(), reason="requires CUDA CCE")
+@pytest.mark.parametrize("masked", [False, True])
+@pytest.mark.parametrize("train_head", [False, True])
+def test_fused_mean_matches_masked_fp32_loss_and_gradients(masked, train_head):
+    """The real BF16 fused kernel must preserve mean CE and empty-pack gradients."""
+    torch.manual_seed(44)
+    hidden = torch.randn(1, 16, 64, device="cuda", dtype=torch.bfloat16).requires_grad_()
+    weight = (torch.randn(128, 64, device="cuda", dtype=torch.bfloat16) / 8).requires_grad_(train_head)
+    labels = torch.arange(16, device="cuda").reshape(1, 16)
+    labels[:, 1::2] = -100
+    if masked:
+        labels.fill_(-100)
+    hidden_ref = hidden.detach().float().requires_grad_()
+    weight_ref = weight.detach().float().requires_grad_(train_head)
+    expected = F.cross_entropy(
+        (hidden_ref @ weight_ref.T).flatten(0, 1),
+        labels.flatten(),
+        reduction="sum",
+    ) / (labels != -100).sum().clamp_min(1)
+    observed = FusedLinearCrossEntropy(reduction="mean")(hidden, labels, weight)
+    expected.backward()
+    observed.backward()
+    torch.testing.assert_close(observed.float(), expected, rtol=0.01, atol=0.001)
+    torch.testing.assert_close(hidden.grad.float(), hidden_ref.grad, rtol=0.02, atol=0.0005)
+    if train_head:
+        torch.testing.assert_close(weight.grad.float(), weight_ref.grad, rtol=0.02, atol=0.0005)
+    if masked:
+        assert observed.item() == 0
+        assert torch.count_nonzero(hidden.grad) == 0

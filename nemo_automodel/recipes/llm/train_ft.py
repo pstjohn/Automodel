@@ -154,6 +154,8 @@ def _maybe_downgrade_loss_fn(loss_fn: nn.Module, probe_module: nn.Module, pp_ena
     """Downgrade to MaskedCrossEntropy when the requested loss cannot run."""
     if not _supports_logits_to_keep(probe_module) and not isinstance(loss_fn, MaskedCrossEntropy):
         logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
+        if isinstance(loss_fn, FusedLinearCrossEntropy):
+            return MaskedCrossEntropy(reduction=loss_fn.reduction)
         return MaskedCrossEntropy()
     if (
         pp_enabled
@@ -164,7 +166,7 @@ def _maybe_downgrade_loss_fn(loss_fn: nn.Module, probe_module: nn.Module, pp_ena
             "FusedLinearCrossEntropy is not supported under pipeline parallelism for this "
             "model. Using MaskedCrossEntropy instead."
         )
-        return MaskedCrossEntropy()
+        return MaskedCrossEntropy(reduction=loss_fn.reduction)
     return loss_fn
 
 
@@ -527,6 +529,14 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         # Build loss_fn (will be set on pipeline_config if PP enabled)
         self.loss_fn = self.cfg.loss_fn.build()
+        if isinstance(self.loss_fn, (MaskedCrossEntropy, FusedLinearCrossEntropy)) and self.loss_fn.reduction == "mean":
+            # A mean loss weights optimizer-step microbatches equally. One
+            # sequence (or packed record) per microbatch gives equal-record CE.
+            # CP/PP need separate numerator/count transport and are not supported.
+            if self.pp_enabled or self.mesh_context.cp_size != 1:
+                raise ValueError("mean-reduced cross entropy requires cp_size=pp_size=1")
+            if self.cfg.get("step_scheduler.local_batch_size", 1) != 1:
+                raise ValueError("mean-reduced cross entropy requires local_batch_size=1")
         if self.magi.hf_dispatch and isinstance(self.loss_fn, FusedLinearCrossEntropy):  # pragma: no cover
             raise ValueError(
                 "The magi HF backend needs full logits and is incompatible with "
@@ -1010,6 +1020,18 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         num_batches,
         is_train: bool = True,
     ):
+        """Run one rank-local microbatch and optionally accumulate its gradient.
+
+        Args:
+            idx: Index in the current accumulation window.
+            batch: Mapping containing input IDs and labels of shape
+                [batch, sequence], plus model-specific forward tensors. Mean
+                CE requires batch=1; a THD sequence is one packed record.
+            loss_buffer: Destination list for detached scalar contributions.
+            num_label_tokens: Global labeled-token count for sum-reduced CE.
+            num_batches: Actual number of microbatches in this optimizer step.
+            is_train: Whether to perform backward. Validation stores raw losses.
+        """
         # Move batch to device (handle both tensors and dicts of tensors like causal_mask_mapping)
         batch = {
             k: (
@@ -1113,6 +1135,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         grad_reduce_group=grad_reduce_group,
                     )
                     loss_distributed_kwargs["grad_reduce_group"] = grad_reduce_group
+                mean_loss = (
+                    isinstance(self.loss_fn, (MaskedCrossEntropy, FusedLinearCrossEntropy))
+                    and self.loss_fn.reduction == "mean"
+                )
                 local_loss = calculate_loss(
                     self.loss_fn,
                     logits=getattr(out, "logits", out),
@@ -1120,12 +1146,14 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     model=model,
                     hidden_states=get_final_hidden_states(out),
                     lm_weight=shared_lm_weight,
-                    num_label_tokens=num_label_tokens,
+                    num_label_tokens=None if mean_loss else num_label_tokens,
                     **loss_distributed_kwargs,
                 )
                 mtp_per_depth_h = getattr(out, "mtp_per_depth_h", None)
                 mtp_per_depth_logits = getattr(out, "mtp_per_depth_logits", None)
                 if mtp_per_depth_h is not None or mtp_per_depth_logits is not None:
+                    if mean_loss:
+                        raise ValueError("mean-reduced cross entropy does not support MTP")
                     mtp_cfg = self.cfg.mtp
                     scaling_factor = (
                         mtp_cfg.scaling_factor if mtp_cfg.scaling_factor is not None else out.mtp_loss_scaling_factor
@@ -1144,6 +1172,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         lm_weight=shared_lm_weight,
                         **loss_distributed_kwargs,
                     )
+                if mean_loss and is_train:
+                    # The existing backward multiplier compensates FSDP's rank
+                    # averaging. Normalize by all microbatches first so both
+                    # reporting (rank sum) and gradients are a global mean.
+                    local_loss = local_loss / (num_batches * self._get_dp_group_size(include_cp=True))
                 loss_buffer.append(local_loss.clone().detach())
                 if is_train:
                     (local_loss * self._get_dp_group_size(include_cp=True)).backward()
@@ -1307,6 +1340,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
             total_loss = torch.tensor(0.0, dtype=torch.float32, device=self.dist_env.device)
             total_num_label_tokens = 0
+            total_microbatches = 0
 
             for batch in val_dataloader:
                 loss_buffer = []
@@ -1322,12 +1356,20 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
                 total_loss += torch.sum(torch.stack(loss_buffer)).item()
                 total_num_label_tokens += num_label_tokens
+                total_microbatches += 1
 
         total_loss = self._dp_allreduce(total_loss, include_cp=True)
         total_num_label_tokens = self._dp_allreduce(
             torch.tensor(total_num_label_tokens, dtype=torch.long, device=self.dist_env.device)
         ).item()
-        val_loss = total_loss / max(total_num_label_tokens, 1e-8)
+        mean_loss = (
+            isinstance(self.loss_fn, (MaskedCrossEntropy, FusedLinearCrossEntropy)) and self.loss_fn.reduction == "mean"
+        )
+        if mean_loss:
+            total_microbatches = self._dp_allreduce(
+                torch.tensor(total_microbatches, dtype=torch.long, device=self.dist_env.device)
+            ).item()
+        val_loss = total_loss / max(total_microbatches if mean_loss else total_num_label_tokens, 1e-8)
 
         # For PP, send val_loss and num_label_tokens from last stage to main rank
         if self.pp_enabled:
